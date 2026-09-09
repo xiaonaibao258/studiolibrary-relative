@@ -90,6 +90,28 @@ WEAPON_CONTROL_NAMES = frozenset([
 ])
 
 
+RELATIVE_KEY_ATTRIBUTES = (
+    "translateX", "translateY", "translateZ",
+    "rotateX", "rotateY", "rotateZ",
+    "scaleX", "scaleY", "scaleZ",
+)
+
+
+def isRelativeTransformWritable(attribute):
+    """Return whether a transform channel is visible and can be changed."""
+    fullname = attribute.fullname()
+    if not maya.cmds.attributeQuery(
+            attribute.attr(), node=attribute.name(), exists=True
+    ):
+        return False
+
+    try:
+        visible = maya.cmds.getAttr(fullname, keyable=True) or \
+                  maya.cmds.getAttr(fullname, channelBox=True)
+        return bool(visible and maya.cmds.getAttr(fullname, settable=True))
+    except RuntimeError:
+        return False
+
 def savePose(path, objects, metadata=None, relativeTransform=False,
              relativeObject=None, useRootFollow=True,
              defaultRelativeObject=None):
@@ -739,6 +761,12 @@ class Pose(mutils.TransferObject):
                 continue
 
             dstAttribute = mutils.Attribute(dstNode.name(), attr)
+
+            # Match the normal Pose behaviour: Relative must not write a
+            # transform channel that is hidden, locked, or otherwise not
+            # settable in the destination channel box.
+            if relativeTransform and attr in TRANSFORM_ATTRIBUTES and not isRelativeTransformWritable(dstAttribute):
+                continue
             isConnected = dstAttribute.isConnected()
 
             if (ignoreConnected and isConnected) or (onlyConnected and not isConnected):
@@ -815,14 +843,30 @@ class Pose(mutils.TransferObject):
                                     matrix=True)
                 )
                 worldMatrix = om.MMatrix(relativeMatrix) * referenceMatrix
+                # xform(matrix=...) bypasses the attribute-level checks used
+                # by a normal Pose load. Preserve every hidden, locked, or
+                # otherwise non-settable transform channel after the matrix
+                # operation so Relative does not alter it.
+                protectedAttrs = []
+                nodeType = maya.cmds.nodeType(destinationName)
+                for attrName in TRANSFORM_ATTRIBUTES:
+                    if attrName.startswith("jointOrient") and nodeType != "joint":
+                        continue
+                    attribute = mutils.Attribute(destinationName, attrName)
+                    if not isRelativeTransformWritable(attribute):
+                        protectedAttrs.append((attribute, attribute.value()))
+
                 maya.cmds.xform(destinationName, worldSpace=True,
                                 matrix=list(worldMatrix))
+
+                for attribute, value in protectedAttrs:
+                    attribute.set(value)
+
                 if key:
-                    maya.cmds.setKeyframe(destinationName, attribute=[
-                        "translateX", "translateY", "translateZ",
-                        "rotateX", "rotateY", "rotateZ",
-                        "scaleX", "scaleY", "scaleZ",
-                    ])
+                    for attrName in RELATIVE_KEY_ATTRIBUTES:
+                        attribute = mutils.Attribute(destinationName, attrName)
+                        if attribute.isSettable():
+                            attribute.setKeyframe(value=attribute.value())
             except (RuntimeError, TypeError, ValueError) as error:
                 logger.debug("Ignoring relative transform for %s: %s",
                              destinationName, error)
