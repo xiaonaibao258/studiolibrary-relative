@@ -111,10 +111,10 @@ def savePose(path, objects, metadata=None, relativeTransform=False,
     :type metadata: dict or None
     :rtype: Pose
     """
-    pose = mutils.Pose.fromObjects(
-        objects,
-        relativeTransform=relativeTransform,
-    )
+    # Always capture a complete normal Pose first. Relative transforms are
+    # stored alongside it, so disabling Relative later restores the exact
+    # original Pose behaviour, including custom attributes.
+    pose = mutils.Pose.fromObjects(objects)
 
     if relativeTransform:
         if not objects:
@@ -170,7 +170,7 @@ def loadPose(path, *args, **kwargs):
 
 class Pose(mutils.TransferObject):
 
-    def __init__(self, relativeTransform=False):
+    def __init__(self):
         mutils.TransferObject.__init__(self)
 
         self._cache = None
@@ -181,7 +181,6 @@ class Pose(mutils.TransferObject):
         self._mirrorTable = None
         self._autoKeyFrame = None
         self._relativeCache = []
-        self._savingRelativeTransforms = relativeTransform
 
     def createObjectData(self, name):
         """
@@ -191,9 +190,6 @@ class Pose(mutils.TransferObject):
         :rtype: dict
         """
         attrs = maya.cmds.listAttr(name, unlocked=True, keyable=True) or []
-        if self._savingRelativeTransforms:
-            customAttrs = set(maya.cmds.listAttr(name, userDefined=True) or [])
-            attrs = [attr for attr in attrs if attr not in customAttrs]
         attrs = list(set(attrs))
         attrs = [mutils.Attribute(name, attr) for attr in attrs]
 
@@ -240,8 +236,6 @@ class Pose(mutils.TransferObject):
         :type relativeObject: str
         :rtype: None
         """
-        self.removeCustomAttributeData()
-
         try:
             import maya.api.OpenMaya as om
             referenceMatrix = om.MMatrix(
@@ -275,14 +269,6 @@ class Pose(mutils.TransferObject):
             "referenceName": referenceName,
             "matrixConvention": "objectWorld * referenceWorld.inverse()",
         })
-
-    def removeCustomAttributeData(self):
-        """Remove user-defined attribute values from this relative pose."""
-        for name, data in self.objects().items():
-            customAttrs = maya.cmds.listAttr(name, userDefined=True) or []
-            attrs = data.get("attrs", {})
-            for attr in customAttrs:
-                attrs.pop(attr, None)
 
     def relativeTransformData(self):
         """Return relative-transform metadata, or an empty dictionary."""
