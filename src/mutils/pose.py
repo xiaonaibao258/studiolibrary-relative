@@ -112,6 +112,111 @@ def isRelativeTransformWritable(attribute):
     except RuntimeError:
         return False
 
+
+def _relativeProtectedAttributes(nodeName, nodeType):
+    """Return transform channels that Relative is not allowed to change."""
+    protected = []
+    for attrName in TRANSFORM_ATTRIBUTES:
+        if attrName.startswith("jointOrient") and nodeType != "joint":
+            continue
+        attribute = mutils.Attribute(nodeName, attrName)
+        if not isRelativeTransformWritable(attribute):
+            protected.append((attribute, attribute.value()))
+    return protected
+
+
+def _relativeLocalMatrix(nodeName, worldMatrix, om):
+    """Convert a target world matrix to the node's parent space."""
+    parents = maya.cmds.listRelatives(
+        nodeName, parent=True, fullPath=True
+    ) or []
+    if not parents:
+        return om.MMatrix(worldMatrix)
+    parentMatrix = om.MMatrix(maya.cmds.xform(
+        parents[0], query=True, worldSpace=True, matrix=True
+    ))
+    return om.MMatrix(worldMatrix) * parentMatrix.inverse()
+
+
+def _relativeRotationValues(nodeName, nodeType, localMatrix, om):
+    """Solve visible rotate channel values for a target local matrix."""
+    if nodeType != "joint":
+        rotation = om.MTransformationMatrix(localMatrix).rotation()
+        rotation.reorderIt(int(maya.cmds.getAttr(
+            nodeName + ".rotateOrder"
+        )))
+        return (
+            om.MAngle(rotation.x).asDegrees(),
+            om.MAngle(rotation.y).asDegrees(),
+            om.MAngle(rotation.z).asDegrees(),
+        )
+
+    # Joint rotation includes jointOrient and rotateAxis. A temporary joint
+    # asks Maya to solve the matrix with the same pre-rotation rules.
+    solverName = maya.cmds.createNode(
+        "joint", name="relativePoseRotationSolver"
+    )
+    try:
+        for attrName in (
+                "rotateOrder",
+                "jointOrientX", "jointOrientY", "jointOrientZ",
+                "rotateAxisX", "rotateAxisY", "rotateAxisZ"):
+            maya.cmds.setAttr(
+                solverName + "." + attrName,
+                maya.cmds.getAttr(nodeName + "." + attrName)
+            )
+        maya.cmds.xform(solverName, matrix=list(localMatrix))
+        return maya.cmds.getAttr(solverName + ".rotate")[0]
+    finally:
+        if maya.cmds.objExists(solverName):
+            maya.cmds.delete(solverName)
+
+
+def applyRelativeWorldMatrix(nodeName, worldMatrix, om):
+    """Apply a target world matrix while respecting channel-box rules."""
+    nodeType = maya.cmds.nodeType(nodeName)
+    protected = _relativeProtectedAttributes(nodeName, nodeType)
+    maya.cmds.xform(nodeName, worldSpace=True, matrix=list(worldMatrix))
+    for attribute, value in protected:
+        attribute.set(value)
+
+    # Animation-layer blend nodes can overwrite the rotation set by xform.
+    currentMatrix = om.MMatrix(maya.cmds.xform(
+        nodeName, query=True, worldSpace=True, matrix=True
+    ))
+    currentRotation = om.MTransformationMatrix(
+        currentMatrix
+    ).rotation(asQuaternion=True)
+    targetRotation = om.MTransformationMatrix(
+        worldMatrix
+    ).rotation(asQuaternion=True)
+    rotationDot = abs(
+        currentRotation.x * targetRotation.x +
+        currentRotation.y * targetRotation.y +
+        currentRotation.z * targetRotation.z +
+        currentRotation.w * targetRotation.w
+    )
+    if 1.0 - rotationDot <= 0.00001:
+        return
+
+    rotationValues = _relativeRotationValues(
+        nodeName, nodeType, _relativeLocalMatrix(nodeName, worldMatrix, om), om
+    )
+    for attrName, value in zip(
+            ("rotateX", "rotateY", "rotateZ"), rotationValues):
+        attribute = mutils.Attribute(nodeName, attrName)
+        if isRelativeTransformWritable(attribute):
+            attribute.set(value)
+
+
+def setRelativeTransformKeys(nodeName):
+    """Set keys only on transform channels allowed by the original Pose UI."""
+    for attrName in RELATIVE_KEY_ATTRIBUTES:
+        attribute = mutils.Attribute(nodeName, attrName)
+        if attribute.isSettable():
+            attribute.setKeyframe(value=attribute.value())
+
+
 def savePose(path, objects, metadata=None, relativeTransform=False,
              relativeObject=None, useRootFollow=True,
              defaultRelativeObject=None):
@@ -832,8 +937,12 @@ class Pose(mutils.TransferObject):
         # apply both after every other relative transform.
         relativeCache = sorted(
             self._relativeCache,
-            key=lambda entry: mutils.Node(entry[0]).shortname().split(":")[-1]
-            in WEAPON_CONTROL_NAMES,
+            key=lambda entry: (
+                mutils.Node(entry[0]).shortname().split(":")[-1]
+                in WEAPON_CONTROL_NAMES,
+                (maya.cmds.ls(entry[0], long=True) or [entry[0]])[0].count("|"),
+                entry[0],
+            ),
         )
 
         for destinationName, relativeMatrix, referenceName in relativeCache:
@@ -843,30 +952,9 @@ class Pose(mutils.TransferObject):
                                     matrix=True)
                 )
                 worldMatrix = om.MMatrix(relativeMatrix) * referenceMatrix
-                # xform(matrix=...) bypasses the attribute-level checks used
-                # by a normal Pose load. Preserve every hidden, locked, or
-                # otherwise non-settable transform channel after the matrix
-                # operation so Relative does not alter it.
-                protectedAttrs = []
-                nodeType = maya.cmds.nodeType(destinationName)
-                for attrName in TRANSFORM_ATTRIBUTES:
-                    if attrName.startswith("jointOrient") and nodeType != "joint":
-                        continue
-                    attribute = mutils.Attribute(destinationName, attrName)
-                    if not isRelativeTransformWritable(attribute):
-                        protectedAttrs.append((attribute, attribute.value()))
-
-                maya.cmds.xform(destinationName, worldSpace=True,
-                                matrix=list(worldMatrix))
-
-                for attribute, value in protectedAttrs:
-                    attribute.set(value)
-
+                applyRelativeWorldMatrix(destinationName, worldMatrix, om)
                 if key:
-                    for attrName in RELATIVE_KEY_ATTRIBUTES:
-                        attribute = mutils.Attribute(destinationName, attrName)
-                        if attribute.isSettable():
-                            attribute.setKeyframe(value=attribute.value())
+                    setRelativeTransformKeys(destinationName)
             except (RuntimeError, TypeError, ValueError) as error:
                 logger.debug("Ignoring relative transform for %s: %s",
                              destinationName, error)
