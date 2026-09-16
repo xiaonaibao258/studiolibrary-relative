@@ -740,7 +740,10 @@ class Pose(mutils.TransferObject):
             if relativeTransform:
                 self.cacheRelativeTransforms(matches)
 
-        if not self.cache():
+        # A Relative pose may intentionally contain only transform matrices.
+        # In that case loadCache() has no normal attribute entries, but the
+        # matched matrix cache is sufficient to apply the pose.
+        if not self.cache() and not (relativeTransform and self._relativeCache):
             text = "No objects match when loading data. " \
                    "Turn on debug mode to see more details."
 
@@ -856,22 +859,20 @@ class Pose(mutils.TransferObject):
                     attr in TRANSFORM_ATTRIBUTES:
                 continue
 
-            # A relative pose contains placement data; it must never alter
-            # animator-defined attributes, including in older files which may
-            # have saved them before this rule was introduced.
-            if relativeTransform and attr in customAttrs:
-                continue
+            if relativeTransform:
+                # Placement is restored exclusively by relative world
+                # matrices. Do not first apply the original local transform
+                # attributes: that produces a visible first pass and can
+                # evaluate parents or constraints before matrix application.
+                # Custom attributes remain excluded in Relative mode.
+                if attr in TRANSFORM_ATTRIBUTES or attr in customAttrs:
+                    continue
 
             if attrs and attr not in attrs:
                 continue
 
             dstAttribute = mutils.Attribute(dstNode.name(), attr)
 
-            # Match the normal Pose behaviour: Relative must not write a
-            # transform channel that is hidden, locked, or otherwise not
-            # settable in the destination channel box.
-            if relativeTransform and attr in TRANSFORM_ATTRIBUTES and not isRelativeTransformWritable(dstAttribute):
-                continue
             isConnected = dstAttribute.isConnected()
 
             if (ignoreConnected and isConnected) or (onlyConnected and not isConnected):
@@ -937,12 +938,8 @@ class Pose(mutils.TransferObject):
         # apply both after every other relative transform.
         relativeCache = sorted(
             self._relativeCache,
-            key=lambda entry: (
-                mutils.Node(entry[0]).shortname().split(":")[-1]
-                in WEAPON_CONTROL_NAMES,
-                (maya.cmds.ls(entry[0], long=True) or [entry[0]])[0].count("|"),
-                entry[0],
-            ),
+            key=lambda entry: mutils.Node(entry[0]).shortname().split(":")[-1]
+            in WEAPON_CONTROL_NAMES,
         )
 
         for destinationName, relativeMatrix, referenceName in relativeCache:
