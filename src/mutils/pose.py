@@ -244,21 +244,11 @@ def savePose(path, objects, metadata=None, relativeTransform=False,
     pose = mutils.Pose.fromObjects(objects)
 
     if relativeTransform:
-        if not objects:
-            raise ValueError("Cannot save relative transforms without selected objects.")
-
-        if useRootFollow:
-            # rootFollow is normally not among the pose controls, so it is
-            # deliberately used as an external anchor rather than added to
-            # the saved object data.
-            relativeObject = relativeObject or pose.relativeObjectInNamespace(
-                objects[0], defaultRelativeObject
-            )
-            anchorMode = "configuredObject"
-        else:
-            # In manual mode the final selected control is the anchor.
-            relativeObject = relativeObject or objects[-1]
-            anchorMode = "selectedObject"
+        relativeObject, anchorMode = Pose.resolveRelativeObject(
+            objects, relativeObject=relativeObject,
+            useRootFollow=useRootFollow,
+            defaultRelativeObject=defaultRelativeObject,
+        )
 
         pose.setRelativeTransforms(
             relativeObject,
@@ -351,6 +341,33 @@ class Pose(mutils.TransferObject):
         if namespace:
             return namespace + ":" + relativeObjectName
         return relativeObjectName
+
+    @staticmethod
+    def resolveRelativeObject(
+            objects, relativeObject=None, useRootFollow=True,
+            defaultRelativeObject=None):
+        """Resolve and validate the anchor before starting a Relative save."""
+        if not objects:
+            raise ValueError(
+                "Cannot save relative transforms without selected objects."
+            )
+
+        if useRootFollow:
+            relativeObject = relativeObject or Pose.relativeObjectInNamespace(
+                objects[0], defaultRelativeObject
+            )
+            anchorMode = "configuredObject"
+        else:
+            relativeObject = relativeObject or objects[-1]
+            anchorMode = "selectedObject"
+
+        if not maya.cmds.objExists(relativeObject):
+            raise ValueError(
+                "Cannot save Relative pose: anchor object does not exist: "
+                + relativeObject
+            )
+
+        return relativeObject, anchorMode
 
     def setRelativeTransforms(self, relativeObject, anchorMode="selectedObject",
                               referenceName=None):
@@ -756,8 +773,6 @@ class Pose(mutils.TransferObject):
         if not reference:
             return
 
-        # Do not infer an anchor from an incomplete selection.  Applying a
-        # matrix relative to the wrong object would silently corrupt a pose.
         matched = {srcNode.name(): dstNode.name() for srcNode, dstNode in matches}
         if data.get("anchorMode") in ("rootFollow", "configuredObject"):
             # The target anchor uses the namespace of the target controls.
@@ -769,6 +784,22 @@ class Pose(mutils.TransferObject):
             ) if matched else None
         else:
             destinationReference = matched.get(reference)
+            if not destinationReference and matched:
+                # A manually selected anchor need not be part of the target
+                # selection when loading. Resolve its short name inside the
+                # namespace of a matched target control, so a pose saved as
+                # Manny:Camera:driven_root can also load onto Camera:... .
+                referenceName = reference.rsplit(":", 1)[-1]
+                candidate = self.relativeObjectInNamespace(
+                    next(iter(matched.values())), referenceName
+                )
+                if maya.cmds.objExists(candidate):
+                    destinationReference = candidate
+
+            # When loading back into the original namespace, retain the exact
+            # saved reference name as a final fallback.
+            if not destinationReference and maya.cmds.objExists(reference):
+                destinationReference = reference
 
         if destinationReference and not maya.cmds.objExists(destinationReference):
             destinationReference = None
