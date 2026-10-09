@@ -25,6 +25,7 @@ from studiolibrarymaya import baseloadwidget
 try:
     import mutils
     import maya.cmds
+    import maya.mel
 except ImportError as error:
     print(error)
 
@@ -231,6 +232,25 @@ class PoseItem(baseitem.BaseItem):
 
         self.setSliderEnabled(True)
 
+    def safeSave(self, *args, **kwargs):
+        """Validate Relative input before safeSave replaces an existing Pose."""
+        if kwargs.get("relativeTransform", False):
+            defaultRelativeObject = ""
+            libraryWindow = self.libraryWindow()
+            if libraryWindow:
+                defaultRelativeObject = libraryWindow.defaultRelativeObject()
+
+            # LibraryItem.safeSave() moves an existing item to trash before
+            # calling save(). Validate first so a missing anchor cannot cause
+            # an overwrite attempt to remove the prior Pose.
+            mutils.Pose.resolveRelativeObject(
+                kwargs.get("objects"),
+                useRootFollow=kwargs.get("useRootFollow", True),
+                defaultRelativeObject=defaultRelativeObject,
+            )
+
+        return super(PoseItem, self).safeSave(*args, **kwargs)
+
     def mirrorTableSearchAndReplace(self):
         """
         Get the values for search and replace from the mirror table.
@@ -402,6 +422,129 @@ class PoseItem(baseitem.BaseItem):
             defaultRelativeObject=defaultRelativeObject,
         )
 
+        if kwargs.get("exportFbx", False):
+            self.exportPoseFbx(objects, kwargs.get("name", ""))
+
+    @staticmethod
+    def namespaceFromObject(objectName):
+        """Return an object's namespace with its trailing colon."""
+        namespaces = maya.cmds.ls(objectName, showNamespace=True) or []
+        namespace = namespaces[-1] if namespaces else ""
+        return namespace + ":" if namespace and namespace != ":" else ""
+
+    def exportPoseFbx(self, objects, poseName):
+        """Export the selected character's Export set at the current frame."""
+        if not objects:
+            maya.cmds.warning("Cannot export Pose FBX without selected objects.")
+            return
+
+        namespace = self.namespaceFromObject(objects[0])
+        exportSet = namespace + "Export"
+        if not maya.cmds.objExists(exportSet):
+            maya.cmds.warning(
+                "Cannot export Pose FBX. Export set does not exist: {0}".format(
+                    exportSet
+                )
+            )
+            return
+
+        exportObjects = maya.cmds.sets(exportSet, query=True) or []
+        if not exportObjects:
+            maya.cmds.warning(
+                "Cannot export Pose FBX. Export set is empty: {0}".format(
+                    exportSet
+                )
+            )
+            return
+
+        originalSelection = maya.cmds.ls(selection=True, long=True) or []
+        frame = maya.cmds.currentTime(query=True)
+        endFrame = frame + 1
+        originalMinTime = maya.cmds.playbackOptions(query=True, minTime=True)
+        originalMaxTime = maya.cmds.playbackOptions(query=True, maxTime=True)
+        originalAnimationStart = maya.cmds.playbackOptions(query=True, animationStartTime=True)
+        originalAnimationEnd = maya.cmds.playbackOptions(query=True, animationEndTime=True)
+        # safeSave writes into a temporary directory named after the class,
+        # so use the name entered in the save dialog rather than self.path().
+        poseName = os.path.splitext(os.path.basename(poseName))[0]
+        poseName = poseName or "pose"
+        exportPath = os.path.join(self.path(), poseName + ".fbx")
+        exportPath = exportPath.replace("\\", "/")
+
+        undoChunkOpen = False
+        baked = False
+        originalFbxBake = None
+        originalFbxResample = None
+        try:
+            if not maya.cmds.pluginInfo("fbxmaya", query=True, loaded=True):
+                maya.cmds.loadPlugin("fbxmaya", quiet=True)
+
+            originalFbxBake = maya.mel.eval("FBXExportBakeComplexAnimation -q")
+            originalFbxResample = maya.mel.eval("FBXExportBakeResampleAnimation -q")
+            maya.cmds.playbackOptions(
+                minTime=frame, maxTime=endFrame,
+                animationStartTime=frame, animationEndTime=endFrame,
+            )
+
+
+            maya.cmds.select(exportObjects, replace=True)
+            maya.mel.eval("FBXExportBakeComplexStart -v {0}".format(int(frame)))
+            maya.cmds.undoInfo(
+                openChunk=True, chunkName="StudioLibrary Export Pose FBX"
+            )
+            undoChunkOpen = True
+            maya.cmds.bakeResults(
+                exportObjects,
+                time=(frame, endFrame),
+                simulation=True,
+                sampleBy=1,
+                preserveOutsideKeys=False,
+                sparseAnimCurveBake=False,
+                disableImplicitControl=True,
+                removeBakedAnimFromLayer=True,
+            )
+            maya.cmds.undoInfo(closeChunk=True)
+            undoChunkOpen = False
+            maya.mel.eval("FBXExportBakeComplexEnd -v {0}".format(int(endFrame)))
+            baked = True
+            maya.mel.eval("FBXExportBakeComplexStep -v 1")
+            maya.mel.eval("FBXExportInputConnections -v false")
+            maya.mel.eval("FBXExportBakeComplexAnimation -v false")
+            maya.mel.eval("FBXExportBakeResampleAnimation -v false")
+            maya.mel.eval("FBXExportBakeComplexStart -v {0}".format(int(frame)))
+            maya.mel.eval("FBXExportBakeComplexEnd -v {0}".format(int(endFrame)))
+            maya.mel.eval("FBXExportBakeComplexStep -v 1")
+            maya.mel.eval("FBXExportIncludeChildren -v false")
+            maya.mel.eval(
+                'FBXExport -f "{0}" -s'.format(exportPath.replace('"', '\\"'))
+            )
+            logger.info("Exported Pose FBX: %s", exportPath)
+        except RuntimeError as error:
+            maya.cmds.warning("Cannot export Pose FBX: {0}".format(error))
+        finally:
+            if undoChunkOpen:
+                maya.cmds.undoInfo(closeChunk=True)
+            if baked:
+                maya.cmds.undo()
+            if originalFbxBake is not None:
+                maya.mel.eval(
+                    "FBXExportBakeComplexAnimation -v {0}".format(originalFbxBake)
+                )
+            if originalFbxResample is not None:
+                maya.mel.eval(
+                    "FBXExportBakeResampleAnimation -v {0}".format(originalFbxResample)
+                )
+            maya.cmds.playbackOptions(
+                minTime=originalMinTime, maxTime=originalMaxTime,
+                animationStartTime=originalAnimationStart,
+                animationEndTime=originalAnimationEnd,
+            )
+            if originalSelection:
+                maya.cmds.select(originalSelection, replace=True)
+            else:
+                maya.cmds.select(clear=True)
+
+
     def saveSchema(self):
         """Add optional matrix-based relative transform capture."""
         schema = super(PoseItem, self).saveSchema()
@@ -418,6 +561,15 @@ class PoseItem(baseitem.BaseItem):
             "persistent": True,
             "toolTip": "Store each object's full transform relative to the "
                        "anchor configured below.",
+        })
+        schema.insert(objectsIndex + 1, {
+            "name": "exportFbx",
+            "title": "Export Pose FBX",
+            "type": "bool",
+            "default": False,
+            "persistent": True,
+            "toolTip": "Export the current frame from the selected character's "
+                       "namespace Export set to a same-named FBX beside pose.json.",
         })
         schema.insert(objectsIndex + 1, {
             "name": "useRootFollow",
